@@ -1,6 +1,5 @@
 import streamlit as st
 import pdfplumber
-import fitz  # PyMuPDF
 import json
 import requests
 
@@ -87,6 +86,56 @@ USER QUESTION:
 
     return _extract_json(content)
 
+def _get_key_ci(data, key):
+    if not isinstance(data, dict):
+        return None
+    if key in data:
+        return data[key]
+    key_lc = key.lower()
+    for k, v in data.items():
+        if isinstance(k, str) and k.strip().lower() == key_lc:
+            return v
+    return None
+
+
+def _normalize_n8n_response(result):
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            return {}
+
+    def _has_keys(d):
+        return (
+            _get_key_ci(d, "final_answer") is not None
+            or _get_key_ci(d, "email_body") is not None
+            or _get_key_ci(d, "status") is not None
+        )
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            if _has_keys(obj):
+                return obj
+            if isinstance(obj.get("json"), dict):
+                return obj["json"]
+            for key in ("body", "data", "result"):
+                if key in obj:
+                    found = _walk(obj[key])
+                    if found:
+                        return found
+            for value in obj.values():
+                found = _walk(value)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _walk(item)
+                if found:
+                    return found
+        return {}
+
+    return _walk(result)
+
 st.title("?? Vendor Risk Document Orchestrator")
 
 uploaded_file = st.file_uploader("Upload Document (.pdf or .txt)", type=["pdf", "txt"])
@@ -131,11 +180,18 @@ if structured_data:
             st.error(f"n8n returned non-JSON response: {response.text}")
             st.stop()
 
+        result_data = _normalize_n8n_response(result)
+
         st.subheader("?? Final Analytical Answer")
-        st.write(result.get("final_answer"))
+        st.write(_get_key_ci(result_data, "final_answer"))
 
         st.subheader("?? Generated Email Body")
-        st.text_area("Email Body", result.get("email_body", "No email sent"), height=200, label_visibility="collapsed")
+        st.text_area(
+            "Email Body",
+            _get_key_ci(result_data, "email_body") or "No email sent",
+            height=200,
+            label_visibility="collapsed",
+        )
 
         st.subheader("? Email Automation Status")
-        st.success(result.get("status"))
+        st.success(_get_key_ci(result_data, "status") or "Status not returned from n8n")
