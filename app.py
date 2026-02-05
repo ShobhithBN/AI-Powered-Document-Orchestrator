@@ -5,8 +5,8 @@ import requests
 
 st.set_page_config(page_title="AI Document Orchestrator", layout="wide")
 
-N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
-OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
+N8N_WEBHOOK_URL = st.secrets.get("N8N_WEBHOOK_URL")
+OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = st.secrets.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
 def _load_model_options():
@@ -265,6 +265,9 @@ structured_data = None
 doc_text = None
 
 if uploaded_file and question:
+    if not OPENROUTER_API_KEY:
+        st.error("Missing OPENROUTER_API_KEY in secrets. Add it in .streamlit/secrets.toml.")
+        st.stop()
     with st.spinner("Extracting document text..."):
         doc_text = extract_text(uploaded_file)
 
@@ -280,6 +283,9 @@ if structured_data:
     recipient_email = st.text_input("Recipient Email ID")
 
     if st.button("Send Alert Mail"):
+        if not N8N_WEBHOOK_URL:
+            st.error("Missing N8N_WEBHOOK_URL in secrets. Add it in .streamlit/secrets.toml.")
+            st.stop()
         payload = {
             "document_text": doc_text,
             "question": question,
