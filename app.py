@@ -294,7 +294,12 @@ if structured_data:
         }
 
         with st.spinner("Triggering n8n workflow..."):
-            response = requests.post(N8N_WEBHOOK_URL, json=payload)
+            try:
+                response = requests.post(N8N_WEBHOOK_URL, json=payload, timeout=30)
+            except requests.exceptions.RequestException as exc:
+                st.error(f"Failed to reach n8n webhook: {exc}")
+                st.info("If you're on Streamlit Cloud, a localhost URL won't work. Use a public n8n URL.")
+                st.stop()
 
         if response.status_code != 200:
             st.error(f"n8n error: {response.status_code} {response.text}")
