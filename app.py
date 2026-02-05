@@ -9,6 +9,88 @@ N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
 OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 OPENROUTER_MODEL = st.secrets.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
+def _load_model_options():
+    models = st.secrets.get("OPENROUTER_MODELS")
+    if isinstance(models, str):
+        models = [m.strip() for m in models.split(",") if m.strip()]
+    if isinstance(models, (list, tuple)):
+        cleaned = []
+        seen = set()
+        for m in models:
+            name = str(m).strip()
+            if name and name not in seen:
+                cleaned.append(name)
+                seen.add(name)
+        return cleaned
+    return []
+
+@st.cache_data(ttl=3600)
+def _fetch_openrouter_models():
+    response = requests.get("https://openrouter.ai/api/v1/models", timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data", [])
+    return data if isinstance(data, list) else []
+
+
+def _get_free_model_options():
+    try:
+        models = _fetch_openrouter_models()
+    except Exception as exc:
+        return [], str(exc)
+
+    def _is_zero(value):
+        try:
+            return float(value) == 0.0
+        except (TypeError, ValueError):
+            return False
+
+    free_models = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if not model_id:
+            continue
+        if isinstance(model_id, str) and model_id.endswith(":free"):
+            free_models.append(model_id)
+            continue
+        pricing = model.get("pricing") or {}
+        if _is_zero(pricing.get("prompt")) and _is_zero(pricing.get("completion")) and _is_zero(
+            pricing.get("request")
+        ):
+            free_models.append(model_id)
+
+    free_models = sorted(set(free_models))
+    if "openrouter/free" not in free_models:
+        free_models.insert(0, "openrouter/free")
+    else:
+        free_models = ["openrouter/free"] + [m for m in free_models if m != "openrouter/free"]
+    return free_models, None
+
+def _get_common_model_options():
+    return [
+        "openai/gpt-4o-mini",
+        "openai/gpt-4o",
+        "openai/gpt-4.1-mini",
+        "openai/gpt-4.1",
+        "openai/gpt-4.1-nano",
+        "anthropic/claude-3.5-sonnet",
+        "anthropic/claude-3.5-haiku",
+        "anthropic/claude-3-opus",
+        "google/gemini-2.5-pro",
+        "google/gemini-2.5-flash",
+        "meta-llama/llama-3.1-70b-instruct",
+        "meta-llama/llama-3.1-8b-instruct",
+        "mistralai/mistral-large",
+        "mistralai/mistral-small",
+        "qwen/qwen-2.5-72b-instruct",
+        "qwen/qwen-2.5-7b-instruct",
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-coder",
+        "nousresearch/hermes-3-llama-3.1-70b",
+    ]
+
 def extract_text(file):
     if file.name.endswith(".pdf"):
         text = ""
@@ -38,7 +120,7 @@ def _extract_json(text):
     raise json.JSONDecodeError("No valid JSON found in model output", text, 0)
 
 
-def gemini_dynamic_extraction(document_text, user_question):
+def gemini_dynamic_extraction(document_text, user_question, model_name):
     prompt = f"""
 You are an AI system performing vendor onboarding and security risk assessment.
 
@@ -67,7 +149,7 @@ USER QUESTION:
             "Content-Type": "application/json",
         },
         json={
-            "model": OPENROUTER_MODEL,
+            "model": model_name,
             "messages": [
                 {
                     "role": "system",
@@ -138,6 +220,44 @@ def _normalize_n8n_response(result):
 
 st.title("?? Vendor Risk Document Orchestrator")
 
+free_model_options, free_models_error = _get_free_model_options()
+common_model_options = _get_common_model_options()
+model_options = _load_model_options()
+with st.sidebar:
+    st.subheader("Model Settings")
+    model_source = st.selectbox(
+        "Model List",
+        ["Free (Live)", "Common", "Configured", "Manual"],
+        index=0,
+    )
+
+    if model_source == "Free (Live)":
+        if free_model_options:
+            default_index = 0
+            if OPENROUTER_MODEL in free_model_options:
+                default_index = free_model_options.index(OPENROUTER_MODEL)
+            selected_model = st.selectbox("OpenRouter Free Models", free_model_options, index=default_index)
+        else:
+            if free_models_error:
+                st.caption("Free models list unavailable. Enter a model manually.")
+            selected_model = st.text_input("OpenRouter Model", value=OPENROUTER_MODEL)
+    elif model_source == "Common":
+        default_index = 0
+        if OPENROUTER_MODEL in common_model_options:
+            default_index = common_model_options.index(OPENROUTER_MODEL)
+        selected_model = st.selectbox("OpenRouter Common Models", common_model_options, index=default_index)
+    elif model_source == "Configured":
+        if model_options:
+            default_index = 0
+            if OPENROUTER_MODEL in model_options:
+                default_index = model_options.index(OPENROUTER_MODEL)
+            selected_model = st.selectbox("OpenRouter Models", model_options, index=default_index)
+        else:
+            st.caption("No configured model list found. Enter a model manually.")
+            selected_model = st.text_input("OpenRouter Model", value=OPENROUTER_MODEL)
+    else:
+        selected_model = st.text_input("OpenRouter Model", value=OPENROUTER_MODEL)
+
 uploaded_file = st.file_uploader("Upload Document (.pdf or .txt)", type=["pdf", "txt"])
 question = st.text_input("Ask a vendor-risk question about the document")
 
@@ -149,7 +269,7 @@ if uploaded_file and question:
         doc_text = extract_text(uploaded_file)
 
     with st.spinner("Running Gemini Dynamic Extraction..."):
-        structured_data = gemini_dynamic_extraction(doc_text, question)
+        structured_data = gemini_dynamic_extraction(doc_text, question, selected_model)
 
     st.subheader("?? Structured Data Extracted (JSON)")
     st.json(structured_data)
