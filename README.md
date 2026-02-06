@@ -1,6 +1,6 @@
 # AI Document Orchestrator
 
-Streamlit app that extracts text from PDFs or TXT files, performs dynamic structured extraction using Gemini, and triggers an n8n webhook for conditional email automation.
+Streamlit app that extracts text from PDFs or TXT files, performs dynamic structured extraction using OpenRouter models with optional RAG (retrieval + embeddings), and triggers an n8n webhook for conditional email automation.
 
 ## Setup
 
@@ -17,6 +17,9 @@ pip install -r requirements.txt
 OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY"
 OPENROUTER_MODEL = "openai/gpt-4o-mini"
 N8N_WEBHOOK_URL = "YOUR_N8N_PROD_WEBHOOK_URL"
+OPENROUTER_EMBEDDING_MODEL = "openai/text-embedding-3-small"  # optional
+OPENROUTER_TIMEOUT = 60  # optional
+OPENROUTER_RETRIES = 2   # optional
 ```
 
 ## Run
@@ -24,6 +27,17 @@ N8N_WEBHOOK_URL = "YOUR_N8N_PROD_WEBHOOK_URL"
 ```bash
 streamlit run app.py
 ```
+
+## RAG (Retrieval + Embeddings)
+
+When enabled in the sidebar, the app:
+
+1. Chunks the extracted document text.
+2. Creates embeddings for each chunk.
+3. Retrieves the top‑K most relevant chunks for the user question.
+4. Uses only those chunks as evidence for structured extraction.
+
+This improves precision and helps the model focus on the most relevant clauses and metrics.
 
 ## n8n Workflow
 
@@ -103,3 +117,7 @@ Use the following node order and logic:
      }
      ```
 8. Publish the workflow, then test via Streamlit.
+
+## Payload Notes
+
+When RAG is enabled, the app also sends `retrieved_chunks` to n8n for logging or auditing. You can ignore this field if not needed.

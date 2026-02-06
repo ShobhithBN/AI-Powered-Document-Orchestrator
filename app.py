@@ -2,12 +2,19 @@ import streamlit as st
 import pdfplumber
 import json
 import requests
+import math
+import time
 
 st.set_page_config(page_title="AI Document Orchestrator", layout="wide")
 
 N8N_WEBHOOK_URL = st.secrets.get("N8N_WEBHOOK_URL")
 OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = st.secrets.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_EMBEDDING_MODEL = st.secrets.get(
+    "OPENROUTER_EMBEDDING_MODEL", "openai/text-embedding-3-small"
+)
+OPENROUTER_TIMEOUT = int(st.secrets.get("OPENROUTER_TIMEOUT", 60))
+OPENROUTER_RETRIES = int(st.secrets.get("OPENROUTER_RETRIES", 2))
 
 def _load_model_options():
     models = st.secrets.get("OPENROUTER_MODELS")
@@ -105,6 +112,124 @@ def extract_text(file):
     else:
         return ""
 
+def _chunk_text(text, max_chars=1200, overlap=200):
+    if not text:
+        return []
+    max_chars = max(200, int(max_chars))
+    overlap = max(0, int(overlap))
+    if overlap >= max_chars:
+        overlap = max_chars // 4
+
+    chunks = []
+    step = max_chars - overlap
+    for start in range(0, len(text), step):
+        chunk = text[start : start + max_chars].strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def _cosine_similarity(vec_a, vec_b):
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _embed_texts(texts, model_name):
+    payload = _post_with_retries(
+        "https://openrouter.ai/api/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"model": model_name, "input": texts},
+        timeout=OPENROUTER_TIMEOUT,
+        retries=OPENROUTER_RETRIES,
+    )
+    data = payload.get("data") or []
+    if not isinstance(data, list):
+        raise ValueError("Unexpected embeddings response format")
+
+    embeddings = [None] * len(texts)
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            continue
+        emb = item.get("embedding")
+        item_index = item.get("index", idx)
+        if item_index is None or item_index >= len(texts):
+            continue
+        embeddings[item_index] = emb
+
+    if any(e is None for e in embeddings):
+        raise ValueError("Missing embeddings in response")
+
+    return embeddings
+
+
+def _post_with_retries(url, headers, json, timeout, retries):
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            response = requests.post(url, headers=headers, json=json, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            time.sleep(0.8 * (attempt + 1))
+    raise last_exc
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_chunk_embeddings(document_text, embedding_model, max_chars, overlap):
+    chunks = _chunk_text(document_text, max_chars=max_chars, overlap=overlap)
+    if not chunks:
+        return [], []
+    embeddings = _embed_texts(chunks, embedding_model)
+    return chunks, embeddings
+
+
+def _retrieve_chunks(question, chunks, embeddings, embedding_model, top_k=5):
+    if not chunks:
+        return []
+    query_embedding = _embed_texts([question], embedding_model)[0]
+    scored = []
+    for idx, emb in enumerate(embeddings):
+        score = _cosine_similarity(query_embedding, emb)
+        scored.append((idx, score))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    top_k = min(max(1, int(top_k)), len(scored))
+    results = []
+    for idx, score in scored[:top_k]:
+        results.append(
+            {
+                "chunk_id": idx,
+                "score": float(score),
+                "text": chunks[idx],
+            }
+        )
+    return results
+
+
+def _build_retrieved_context(retrieved_chunks, max_chars=4500):
+    sections = []
+    total = 0
+    for item in retrieved_chunks:
+        header = f"[Chunk {item['chunk_id']} | score {item['score']:.3f}]"
+        body = item["text"].strip()
+        block = f"{header}\n{body}"
+        if total + len(block) + 2 > max_chars:
+            break
+        sections.append(block)
+        total += len(block) + 2
+    return "\n\n".join(sections)
+
 def _extract_json(text):
     try:
         return json.loads(text)
@@ -120,29 +245,37 @@ def _extract_json(text):
     raise json.JSONDecodeError("No valid JSON found in model output", text, 0)
 
 
-def gemini_dynamic_extraction(document_text, user_question, model_name):
+def gemini_dynamic_extraction(document_text, user_question, model_name, retrieved_context=None):
+    if retrieved_context:
+        context_block = f"RETRIEVED CONTEXT (use ONLY this):\n{retrieved_context}"
+        doc_block = ""
+    else:
+        context_block = ""
+        doc_block = f"DOCUMENT:\n{document_text}"
+
     prompt = f"""
 You are an AI system performing vendor onboarding and security risk assessment.
 
 TASK:
 Based on the USER QUESTION, identify and extract the 5-8 MOST RELEVANT key-value fields
-from the document text that are REQUIRED to answer the question.
+from the text that are REQUIRED to answer the question.
 
 Rules:
 - Fields must be dynamically chosen (not fixed).
-- Values must come strictly from the document.
+- Values must come strictly from the provided text.
 - If risk or approval is discussed, add "risk_level" (Low / Medium / High) and a short "risk_rationale".
 - Preserve exact dates, amounts, SLA metrics, and retention windows as written.
+- If a required value is missing, set it to null and add "insufficient_evidence": true.
 - Output MUST be valid JSON only.
 
-DOCUMENT:
-{document_text}
+{context_block}
+{doc_block}
 
 USER QUESTION:
 {user_question}
 """
 
-    response = requests.post(
+    payload = _post_with_retries(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -161,10 +294,10 @@ USER QUESTION:
             "temperature": 0.2,
             "max_tokens": 2048,
         },
-        timeout=60,
+        timeout=OPENROUTER_TIMEOUT,
+        retries=OPENROUTER_RETRIES,
     )
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
+    content = payload["choices"][0]["message"]["content"]
 
     return _extract_json(content)
 
@@ -258,11 +391,20 @@ with st.sidebar:
     else:
         selected_model = st.text_input("OpenRouter Model", value=OPENROUTER_MODEL)
 
+    st.subheader("RAG Settings")
+    enable_rag = st.checkbox("Enable Retrieval (RAG)", value=True)
+    embedding_model = st.text_input("Embedding Model", value=OPENROUTER_EMBEDDING_MODEL)
+    top_k = st.slider("Top-K Chunks", min_value=2, max_value=10, value=5, step=1)
+    chunk_size = st.slider("Chunk Size (chars)", min_value=400, max_value=2000, value=1200, step=100)
+    chunk_overlap = st.slider("Chunk Overlap (chars)", min_value=0, max_value=500, value=200, step=50)
+
 uploaded_file = st.file_uploader("Upload Document (.pdf or .txt)", type=["pdf", "txt"])
 question = st.text_input("Ask a vendor-risk question about the document")
 
 structured_data = None
 doc_text = None
+retrieved_chunks = []
+retrieved_context = None
 
 if uploaded_file and question:
     if not OPENROUTER_API_KEY:
@@ -271,11 +413,44 @@ if uploaded_file and question:
     with st.spinner("Extracting document text..."):
         doc_text = extract_text(uploaded_file)
 
-    with st.spinner("Running Gemini Dynamic Extraction..."):
-        structured_data = gemini_dynamic_extraction(doc_text, question, selected_model)
+    if enable_rag and doc_text:
+        with st.spinner("Chunking and embedding document..."):
+            try:
+                chunks, embeddings = _get_chunk_embeddings(
+                    doc_text, embedding_model, chunk_size, chunk_overlap
+                )
+            except Exception as exc:
+                st.error(f"Embedding error: {exc}")
+                chunks, embeddings = [], []
+
+        if chunks and embeddings:
+            with st.spinner("Retrieving relevant context..."):
+                try:
+                    retrieved_chunks = _retrieve_chunks(
+                        question, chunks, embeddings, embedding_model, top_k=top_k
+                    )
+                    retrieved_context = _build_retrieved_context(retrieved_chunks)
+                except Exception as exc:
+                    st.error(f"Retrieval error: {exc}")
+
+    with st.spinner("Running Dynamic Extraction..."):
+        try:
+            structured_data = gemini_dynamic_extraction(
+                doc_text, question, selected_model, retrieved_context=retrieved_context
+            )
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Model request failed: {exc}")
+            st.info("Try increasing the timeout or retries in the sidebar.")
+            structured_data = None
 
     st.subheader("?? Structured Data Extracted (JSON)")
     st.json(structured_data)
+
+    if retrieved_chunks:
+        with st.expander("?? Retrieved Evidence Chunks"):
+            for item in retrieved_chunks:
+                st.markdown(f"**Chunk {item['chunk_id']}** (score {item['score']:.3f})")
+                st.write(item["text"])
 
 if structured_data:
     st.subheader("?? Conditional Alert Automation")
@@ -290,6 +465,7 @@ if structured_data:
             "document_text": doc_text,
             "question": question,
             "structured_data": structured_data,
+            "retrieved_chunks": retrieved_chunks,
             "recipient_email": recipient_email
         }
 
